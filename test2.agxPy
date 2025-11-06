@@ -1,0 +1,440 @@
+"""
+This example demonstrates the use of Granular simulation and an excavator model
+"""
+
+import agxCollide
+import agx
+import agxSDK
+import agxOSG
+import agxRender
+import agxUtil
+import agxDriveTrain
+import math
+import sys
+import os
+
+
+from agxPythonModules.utils.environment import simulation, root, application, init_app
+from agxPythonModules.utils.callbacks import (
+    StepEventCallback,
+    KeyboardCallback as Input,
+    GamepadCallback as Gamepad,
+)
+from agxPythonModules.utils.Struct import Struct
+
+
+import collections
+
+from importlib import reload
+
+if "agxPythonModules.models.excavators.excavator365" in sys.modules:
+    reload(sys.modules["agxPythonModules.models.excavators.excavator365"])
+
+from agxPythonModules.models.excavators.excavator365 import Excavator365 as Excavator
+
+
+def setup_camera(app):
+    cameraData = app.getCameraData()
+    cameraData.eye = agx.Vec3(-6.992e-01, -1.2420e01, 4.68018)
+    cameraData.center = agx.Vec3(-5.595, 2.6121, 7.8313e-01)
+    cameraData.up = agx.Vec3(-8.0669e-02, 2.25419e-01, 9.7091e-01)
+    cameraData.nearClippingPlane = 0.1
+    cameraData.farClippingPlane = 5000
+    app.applyCameraData(cameraData)
+
+
+def lerp(a, b, s):
+    if s > 1:
+        return b
+    if s <= 0:
+        return a
+
+    return a * (1 - s) + b * s
+
+
+class JointController(agxSDK.StepEventListener):
+    """
+    Controlling the movement of a number of joints based on pre-defined poses.
+    A pose consists of an angle/distance and a time.
+    This controller will try to reach the target angle/distance at the specifified time
+    """
+
+    def __init__(self, excavator, joint_poses):
+        super().__init__()
+
+        self.joint_poses = joint_poses
+        self.current_index = 0
+        self.constraints = collections.OrderedDict()
+        self.constraints["cabin"] = excavator.cabin_hinge
+        self.constraints["bucket"] = excavator.bucket_prismatic
+        self.constraints["stick"] = excavator.stick_prismatic
+        self.constraints["arm"] = excavator.arm_prismatics[1]
+
+        # Disable one of the arm prismatics, lets just use one of them for this excavator
+        c = excavator.arm_prismatics[0]
+        c.getMotor1D().setEnable(False)
+        c.getLock1D().setEnable(False)
+        c.getRange1D().setEnable(False)
+
+        self.joint_target_pos = collections.OrderedDict()
+        for name in self.constraints:
+            c = self.constraints[name]
+            self.joint_target_pos[name] = c.getAngle()
+
+    def set_target(self, name, pos):
+        print("set_target", name, pos)
+        self.joint_target_pos[name] = pos
+
+    def pre(self, time):
+        self.updateJointPoses()
+
+    def calculateDamping(self, distance, max_speed):
+        dt = simulation().getTimeStamp()
+        damping = max(2, abs(distance / (dt * max_speed)))
+        return damping
+
+    def updateJointPoses(self):
+        """
+        Loop over all constraint and update the poses
+        """
+        for name in self.constraints:
+            c = self.constraints[name]
+            c.getMotor1D().setEnable(False)
+            c.getLock1D().setEnable(True)
+
+            curr = c.getAngle()
+            next = self.joint_target_pos[name]
+            distance = abs(next - curr)
+
+            s = distance * 0.1
+
+            # Now interpolate (using log scale) the damping
+            damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+            damping = max(damping, 2 / 60)
+            c.getLock1D().setDamping(damping)
+            c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+            # Set the target position/angle
+            c.getLock1D().setPosition(next)
+
+
+def start_automatic_digging(excavator):
+    """
+    Start an automatic digging process with pre-defined operations.
+    """
+
+    print("Starting Automatic digging cycle")
+
+    excavator.gamepad_controls = None
+
+    def digCycle(start_time, arm_height, cabin_start):
+        """
+        Creates a number of poses that together form a digging cycle
+        """
+        return [
+            [start_time + 0, {"cabin": cabin_start + 0.0}],
+            [start_time + 0, {"stick": -0.4}],
+            [start_time + 0, {"bucket": -0.9}],
+            [start_time + 2, {"arm": arm_height - 0.2}],
+            [start_time + 2, {"stick": 0.6}],
+            [start_time + 3, {"bucket": 0.0}],
+            [start_time + 6, {"arm": arm_height + 0.5}],
+            [start_time + 7, {"bucket": 0.2}],
+            [start_time + 7, {"arm": arm_height + 1}],
+        ]
+
+    def set_speed(speed):
+        """
+        Set the speed of the driving hinges of the excavator
+        """
+        for h in excavator.sprocket_hinges:
+            print("Speed: ", speed)
+            h.getLock1D().setEnable(False)
+            h.getMotor1D().setEnable(True)
+            h.getMotor1D().setSpeed(speed)
+
+    def drive_excavator(start, speed, duration):
+        """
+        Start driving forward at a specific time, with a given speed during a specified period
+
+        Arguments:
+            start - start time
+            speed - target speed
+            duration - Duration of the motion
+        """
+        StepEventCallback.callIn(start, lambda speed=speed: set_speed(speed))
+        StepEventCallback.callIn(start + duration, lambda: set_speed(0))
+
+    poses = []
+    time = 0
+    poses.extend(digCycle(0.5, 0.01, 0))
+    time = 0.5
+
+    print("Total cycle time: ", time)
+
+    joint_controller = JointController(excavator, poses)
+
+    # Setup all the events for all the digging cycles
+    for p in poses:
+        time = p[0]
+        i = 0
+        for name in p[1]:
+            i += 1
+            val = p[1][name]
+            arg = [name, val]
+            StepEventCallback.callIn(
+                time, lambda arg=arg: joint_controller.set_target(arg[0], arg[1])
+            )
+
+    simulation().add(joint_controller)
+
+
+def create_box(size, thickness):
+
+    body = agx.RigidBody()
+    b1 = agxCollide.Geometry(
+        agxCollide.Box(size[0] * 0.5, size[1] * 0.5, thickness * 0.5)
+    )
+    body.add(b1, agx.AffineMatrix4x4.translate(0, 0, -thickness * 0.5))
+
+    b2 = agxCollide.Geometry(
+        agxCollide.Box(thickness * 0.5, size[1] * 0.5, size[2] * 0.5)
+    )
+    body.add(
+        b2,
+        agx.AffineMatrix4x4.translate(
+            -size[0] * 0.5 + thickness * 0.5, 0, size[2] * 0.5 - thickness
+        ),
+    )
+
+    b3 = agxCollide.Geometry(
+        agxCollide.Box(thickness * 0.5, size[1] * 0.5, size[2] * 0.5)
+    )
+    body.add(
+        b3,
+        agx.AffineMatrix4x4.translate(
+            size[0] * 0.5 - thickness * 0.5, 0, size[2] * 0.5 - thickness
+        ),
+    )
+
+    b4 = agxCollide.Geometry(
+        agxCollide.Box(size[0] * 0.5, thickness * 0.5, size[2] * 0.5)
+    )
+    body.add(
+        b4,
+        agx.AffineMatrix4x4.translate(
+            0, size[1] * 0.5 - thickness * 0.5, size[2] * 0.5 - thickness
+        ),
+    )
+
+    b5 = agxCollide.Geometry(
+        agxCollide.Box(size[0] * 0.5, thickness * 0.5, size[2] * 0.5)
+    )
+    body.add(
+        b5,
+        agx.AffineMatrix4x4.translate(
+            0, -size[1] * 0.5 + thickness * 0.5, size[2] * 0.5 - thickness
+        ),
+    )
+
+    return body
+
+
+def set_contact_material(spec, material):
+    material.setYoungsModulus(spec.youngs_modulus)
+    material.setFrictionCoefficient(spec.friction_coefficient)
+    material.setRollingResistanceCoefficient(spec.rolling_coefficient)
+    material.setDamping(spec.damping)
+    material.setAdhesion(spec.adhesion, spec.adhesive_overlap)
+    material.setRestitution(spec.restitution)
+
+
+def create_particles(particle_spec, ground_material, spawn_box):
+    # Create and configure the particle system.
+    granularBodySystem = agx.GranularBodySystem()
+    simulation().add(granularBodySystem)
+
+    simulation().getDynamicsSystem().getSolver().setUseParallelPgs(True)
+
+    # Enable 32bit float solver for granular bodies to increase performance
+    simulation().getDynamicsSystem().getSolver().setUse32bitGranularBodySolver(True)
+
+    # Create two materials so we can define the interaction parameters
+    particle_material = agx.Material("particles")
+
+    # Setup the material properties
+    particle_material.getBulkMaterial().setDensity(particle_spec.density)
+    c = (
+        simulation()
+        .getMaterialManager()
+        .getOrCreateContactMaterial(particle_material, ground_material)
+    )
+    set_contact_material(particle_spec.particle_ground, c)
+
+    c2 = (
+        simulation()
+        .getMaterialManager()
+        .getOrCreateContactMaterial(particle_material, particle_material)
+    )
+    set_contact_material(particle_spec.particle_particle, c2)
+
+    # Specify the radius of each granular body
+    granularBodySystem.setParticleRadius(particle_spec.radius)
+
+    # Set the default material of all the granular bodies
+    granularBodySystem.setMaterial(particle_material)
+
+    # Spawn a bunch of particles in the container.
+    granularBodySystem.spawnParticlesInBound(
+        spawn_box,
+        granularBodySystem.getParticleRadius(),
+        agx.Vec3(2.0 * granularBodySystem.getParticleRadius()),
+        0.3 * granularBodySystem.getParticleRadius(),
+    )
+    agxOSG.createVisual(granularBodySystem, root())
+
+
+def buildScene1():
+
+    particle_specification = Struct(
+        {
+            "time_step": 1 / 100,
+            "num_resting_iterations": 150,
+            "radius": 0.05,
+            "density": 1.3e3,
+            "particle_ground": {
+                "youngs_modulus": 1.0e7,
+                "friction_coefficient": 0.4,
+                "rolling_coefficient": 0.1,
+                "damping": 4.5,
+                "adhesion": 2,
+                "adhesive_overlap": 0.005,
+                "restitution": 0.0,
+            },
+            "particle_particle": {
+                "youngs_modulus": 1e11,
+                "friction_coefficient": 0.4,
+                "rolling_coefficient": 0.1,
+                "damping": 4.5,
+                "adhesion": 2000,
+                "adhesive_overlap": 0.005,
+                "restitution": 0.0,
+            },
+        }
+    )
+
+    # Create a ground
+    ground_size = [12, 15, 0.1]
+
+    ground = agxCollide.Geometry(
+        agxCollide.Box(ground_size[0] * 0.5, ground_size[1] * 0.5, ground_size[2] * 0.5)
+    )
+    ground_body = agx.RigidBody(ground)
+    ground_body.setMotionControl(agx.RigidBody.KINEMATICS)
+    ground_body.setPosition(agx.Vec3(0, 0, -ground_size[2] * 0.5))
+    simulation().add(ground_body)
+    agxOSG.createVisual(ground_body, root())
+
+    ground_material = agx.Material("Ground")
+    agxUtil.setBodyMaterial(ground_body, ground_material)
+
+    # Create a container box
+    size = [9, 3, 1.3]
+    thickness = 0.1
+
+    position = agx.Vec3(0, 0.3, thickness) + agx.Vec3(
+        -size[0] * 0.5 - ground_size[0] * 0.5, 0, -size[2] * 0.88
+    )
+    box = create_box(size, thickness)
+    box.setPosition(position)
+    box.setMotionControl(agx.RigidBody.KINEMATICS)
+    agxOSG.createVisual(box, root())
+    simulation().add(box)
+    agxUtil.setBodyMaterial(box, ground_material)
+
+    # Spawn particles in the box
+    lower = (
+        agx.Vec3(0, 0, size[2]) * 0.5
+        + position
+        + agx.Vec3(
+            -size[0] + thickness + particle_specification.radius * 2,
+            -size[1] + thickness + particle_specification.radius * 2,
+            -size[2],
+        )
+        * 0.5
+    )
+
+    upper = (
+        agx.Vec3(0, 0, size[2]) * 0.5
+        + position
+        + agx.Vec3(
+            size[0] - thickness - particle_specification.radius * 2,
+            size[1] - thickness - particle_specification.radius * 2,
+            size[2] - thickness,
+        )
+        * 0.5
+    )
+
+    spawn_box = agx.Bound3(lower, upper)
+
+    create_particles(particle_specification, ground_material, spawn_box)
+
+    keyboard_controls = Excavator.default_keyboard_settings()
+    gamepad_controls = Excavator.default_gamepad_controls()
+
+    # Create an excavator
+    excavator = Excavator(
+        gamepad_controls=gamepad_controls, keyboard_controls=keyboard_controls
+    )
+    excavator.setPosition(-2, 0, 0)
+    simulation().add(excavator)
+
+    # The Bucket body consists of meshes (disabled) and boxes (enabled)
+    # When simulating with granular we want to use the mesh model.
+    # So we just loop through all the geometries and toggle collisonEnable
+    geoms = excavator.bucket_body.getGeometries()
+    for g in geoms:
+        enabled = g.getEnableCollisions()
+        print(g.getName(), enabled)
+        g.setEnableCollisions(not enabled)
+
+    # Bind a keyboard button for starting the automatic digging cycle
+    Input.bind(
+        name="Automatic Digging",
+        key=ord("2"),
+        mode=Input.Mode.NATIVE,
+        callback=lambda data: start_automatic_digging(excavator),
+    )
+
+    # Configure the contact material between the tracks and the ground(terrain)
+    excavator.configure_track_ground_contact_materials(ground)
+
+    # Use as many cores as we can, except for one
+    agx.setNumThreads(0)
+    n = int(agx.getNumThreads() / 2) - 1
+    agx.setNumThreads(n)
+
+    simulation().getDynamicsSystem().getSolver().setNumRestingIterations(
+        particle_specification.num_resting_iterations
+    )
+
+    application().getSceneDecorator().setBackgroundColor(
+        agxRender.Color.SkyBlue(), agxRender.Color.DodgerBlue()
+    )
+
+    # Enable warm starting of contacts
+    simulation().getDynamicsSystem().setEnableContactWarmstarting(True)
+
+    setup_camera(application())
+    # createHelpText(simulation(), application())
+
+    simulation().setTimeStamp(particle_specification.time_step)
+
+    # Here we just start the bucket movement at 4 seconds to allow for some resting of the particles.
+    StepEventCallback.callAt(0, lambda: start_automatic_digging(excavator))
+
+
+def buildScene():
+    buildScene1()
+
+
+init = init_app(name=__name__, scenes=[(buildScene1, "1")], autoStepping=False)
