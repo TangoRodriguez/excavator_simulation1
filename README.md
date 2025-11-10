@@ -3,7 +3,7 @@
 AGX Dynamics を用いた油圧ショベルの掘削シミュレーション。
 AGX SDK の agxviewer 環境で動作し、粒子（砂）を掬う動作とパラメータ調整が可能です。
 
-🔧 実行手順
+実行手順
 必要環境
 
 AGX Dynamics 2.40+
@@ -25,11 +25,11 @@ agxviewer AGX_Test/test3.agxPy
 
 ※ ダブルクリックでは UI が出ません。必ず AGX Command から起動してください。
 
-🧩 シミュレーション概要
+シミュレーション概要
 ファイル	機能概要
 test1.agxPy	初期デモ。ショベルモデル＋粒子生成。動作確認用。
 test2.agxPy	Lock1Dと関節制御の安定化、粒子接触パラメータ修正。
-test3.agxPy	🎮 UI・スコアリング機能を追加。掘削効率をリアルタイム測定。
+test3.agxPy	 UI・スコアリング機能を追加。掘削効率をリアルタイム測定。
 🕹 操作方法
 キー	機能
 E	掘削開始（ベースライン保存＋スコア測定開始）
@@ -41,7 +41,8 @@ L	Toggle モード切替
 { / }	Damping（減衰）調整
 , / .	Adhesion（付着）調整
 - / =	Force（油圧出力）調整
-📊 スコアリング仕様
+
+スコアリング仕様
 
 HUD上に表示：
 
@@ -81,22 +82,12 @@ Lift/Peak のログを CSV 出力
 
 Unreal Engine プラグイン連携テスト
 
-👤 Author
+Author
 
 Tango Saito (齋藤旦伍)
 Waseda University – Silvereye Project
 AGX Excavator Simulation Research
 
-📎 実行例
 
-🧰 ライセンス
 
-本プロジェクトは AGX Dynamics Evaluation License の範囲内で実行されています。
 
-🧩 GitHub コマンド
-
-README を保存したら、以下で push！
-
-git add README.md
-git commit -m "Update README with test3.agxPy details"
-git push origin main
