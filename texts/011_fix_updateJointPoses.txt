@@ -1,0 +1,32 @@
+Title: Restore JointController.updateJointPoses and remove misplaced HUD copy
+Date: 2025-11-09
+
+Summary
+- Fixed runtime error: "[JointController.pre] error: 'JointController' object has no attribute 'updateJointPoses'".
+- Root cause: updateJointPoses (and a helper) were accidentally placed under HudUpdater during prior patching, so JointController couldn't find the method.
+- Action: Moved updateJointPoses back into JointController; removed the duplicate methods from HudUpdater. Added a guarded calculateDamping helper in JointController (not strictly required, but kept around as a utility).
+
+Files changed
+- AGX_Test/test1.agxPy
+  - Added: JointController.calculateDamping(distance, max_speed)
+  - Added: JointController.updateJointPoses(sim_time)
+  - Removed (from HUD): calculateDamping/updateJointPoses that were mistakenly scoped under HudUpdater
+
+Behavioral notes
+- JointController.pre(time) now correctly calls self.updateJointPoses(time) each tick without attribute errors.
+- Lock1D is enabled, Motor1D disabled per joint; damping is interpolated between LOCK_DAMPING_MIN/MAX based on distance to target.
+- Force range is taken from PARAM_BINDER.effective_force_range() when available, else UI_STATE.force_range().
+- Early simulation window (<= LOG_TIME_WINDOW) still logs concise joint state every LOG_SAMPLE_STEPS.
+
+How to validate
+- Launch the simulation as before. Within ~3 seconds, the previous repeated error line should be gone.
+- Expect to see:
+  - "JointController.pre activated at t=... registered 4 joints"
+  - Periodic joint logs within the first few seconds
+  - HUD text overlay updating (Mode/Friction/Damping/Force)
+  - Keyboard: A (Apply), L (Toggle Live), P/O (Pause/Resume), R (Reset), 2 (AutoDig)
+
+Next candidates
+- Implement full scene Reset (rebuild) instead of UI-only reset
+- Add mouse-driven buttons/sliders on the 2D HUD and wire to UiState (with Live/Apply)
+- Optional: expose switch for LOCK vs MOTOR tracking modes per joint

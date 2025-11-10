@@ -57,6 +57,99 @@ LOG_SAMPLE_STEPS = 8
 LOG_TIME_WINDOW = 3.0
 
 
+# ---------------------------------------------------------------------------
+# UI STATE (Sprint 1 minimal skeleton)
+# ---------------------------------------------------------------------------
+# 目的: HUD から操作するパラメータ群を 1 箇所に集約し、
+#  Apply 時/Live 時の反映を制御しやすくするためのデータモデル。
+#  今回スプリントでは粒子側は『摩擦/減衰』、ジョイント側は『力レンジ』のみ操作対象。
+#  次スプリント以降で radius/density/油圧フィール等を拡張予定。
+
+try:
+    from dataclasses import dataclass, field
+except ImportError:
+    # dataclasses が無い古い Python の場合は簡易クラスで代替
+    dataclass = None
+
+if dataclass:
+    @dataclass
+    class UiState:
+        # 反映モード: 'LIVE' or 'APPLY'
+        apply_mode: str = 'APPLY'
+
+        # 粒子(一部)パラメータ - ContactMaterial 更新対象
+        friction: float = PARTICLE_BUCKET_CONTACT.friction_coefficient
+        damping: float = PARTICLE_BUCKET_CONTACT.damping
+        restitution: float = PARTICLE_BUCKET_CONTACT.restitution
+        adhesion: float = PARTICLE_BUCKET_CONTACT.adhesion
+
+        # Excavator joints 操作対象 (Sprint1: force_range のみ可変)
+        # target は既存 JointController スケジューラが更新するため初期値 0
+        # force_range_base は UI のスライダー値に対する基本値
+        force_range_base: float = 1.0e6
+
+        # StartDelay (自動掘削開始遅延)
+        start_delay: float = START_DELAY
+
+        # 操作対象ジョイント名リスト (HUD で順番制御用)
+        joint_names: list = field(default_factory=lambda: ["cabin", "bucket", "stick", "arm"])
+
+        # 将来拡張予約フィールド（油圧フィール等）
+        hydraulic_enabled: bool = False
+
+        def force_range(self):
+            """UI スライダーから計算した双方向力レンジを返す (±値)。"""
+            return agx.RangeReal(-self.force_range_base, self.force_range_base)
+
+        def clone(self):
+            """現在値のシャローコピー (Apply 用差分検出にも利用予定)。"""
+            if dataclass:
+                import copy
+                return copy.copy(self)
+            c = UiState()
+            c.apply_mode = self.apply_mode
+            c.friction = self.friction
+            c.damping = self.damping
+            c.restitution = self.restitution
+            c.adhesion = self.adhesion
+            c.force_range_base = self.force_range_base
+            c.start_delay = self.start_delay
+            c.joint_names = list(self.joint_names)
+            c.hydraulic_enabled = self.hydraulic_enabled
+            return c
+else:
+    class UiState:
+        apply_mode = 'APPLY'
+        friction = PARTICLE_BUCKET_CONTACT.friction_coefficient
+        damping = PARTICLE_BUCKET_CONTACT.damping
+        restitution = PARTICLE_BUCKET_CONTACT.restitution
+        adhesion = PARTICLE_BUCKET_CONTACT.adhesion
+        force_range_base = 1.0e6
+        start_delay = START_DELAY
+        joint_names = ["cabin", "bucket", "stick", "arm"]
+        hydraulic_enabled = False
+
+        def force_range(self):
+            return agx.RangeReal(-self.force_range_base, self.force_range_base)
+
+        def clone(self):
+            c = UiState()
+            c.apply_mode = self.apply_mode
+            c.friction = self.friction
+            c.damping = self.damping
+            c.restitution = self.restitution
+            c.adhesion = self.adhesion
+            c.force_range_base = self.force_range_base
+            c.start_delay = self.start_delay
+            c.joint_names = list(self.joint_names)
+            c.hydraulic_enabled = self.hydraulic_enabled
+            return c
+
+# グローバル UI 状態インスタンス
+UI_STATE = UiState()
+# 既定値のバックアップ（Reset 用に使用）
+DEFAULT_UI_STATE = UI_STATE.clone()
+
 def setup_camera(app):
     cameraData = app.getCameraData()
     cameraData.eye = agx.Vec3(-6.992e-01, -1.2420e01, 4.68018)
@@ -106,32 +199,52 @@ class JointController(agxSDK.StepEventListener):
             self.joint_target_pos[name] = c.getAngle()
         self.step_counter = 0
         self._pre_logged = False
+        self._paused = False
 
     def set_target(self, name, pos):
+        if getattr(self, "_disposed", False):
+            # ignore scheduled callbacks after dispose
+            return
         print("set_target", name, pos)
         self.joint_target_pos[name] = pos
 
     def pre(self, time):
-        if not self._pre_logged:
-            print(
-                "JointController.pre activated at t={:.3f}, registered {} joints".format(
-                    time, len(self.constraints)
+        try:
+            if self._paused:
+                return
+            if not self._pre_logged:
+                print(
+                    "JointController.pre activated at t={:.3f}, registered {} joints".format(
+                        time, len(self.constraints)
+                    )
                 )
-            )
-            self._pre_logged = True
-        self.step_counter += 1
-        self.updateJointPoses(time)
+                self._pre_logged = True
+            self.step_counter += 1
+            self.updateJointPoses(time)
+        except Exception as e:
+            print("[JointController.pre] error:", e)
+
+    def pause(self):
+        self._paused = True
+        print("[Controller] paused")
+
+    def resume(self):
+        self._paused = False
+        print("[Controller] resumed")
+
+    def dispose(self):
+        """Mark controller as disposed so scheduled callbacks become no-ops."""
+        self._disposed = True
 
     def calculateDamping(self, distance, max_speed):
         dt = simulation().getTimeStep()
-        damping = max(2, abs(distance / (dt * max_speed)))
-        return damping
+        try:
+            return max(2, abs(distance / (dt * max_speed)))
+        except Exception:
+            return LOCK_DAMPING_MIN
 
     def updateJointPoses(self, sim_time):
-        """
-        Loop over all constraint and update the poses
-        """
-        # Pull each joint toward its target position using lock constraints every simulation tick.
+        """Update all joint lock targets and log early phase samples."""
         for name, constraint in self.constraints.items():
             motor = constraint.getMotor1D()
             lock = constraint.getLock1D()
@@ -145,7 +258,12 @@ class JointController(agxSDK.StepEventListener):
             damping = agx.logInterpolate(LOCK_DAMPING_MIN, LOCK_DAMPING_MAX, min(1.0, distance))
             damping = max(LOCK_DAMPING_MIN, min(LOCK_DAMPING_MAX, damping))
             lock.setDamping(damping)
-            lock.setForceRange(LOCK_FORCE_RANGE)
+            # Force range from UI/binder
+            try:
+                fr = PARAM_BINDER.effective_force_range() if 'PARAM_BINDER' in globals() and PARAM_BINDER is not None else UI_STATE.force_range()
+            except Exception:
+                fr = UI_STATE.force_range()
+            lock.setForceRange(fr)
             if hasattr(lock, "setCompliance"):
                 lock.setCompliance(1.0e-9)
 
@@ -164,14 +282,14 @@ class JointController(agxSDK.StepEventListener):
             lock.setPosition(target)
 
             if sim_time <= LOG_TIME_WINDOW and self.step_counter % LOG_SAMPLE_STEPS == 0:
-                fr = lock.getForceRange()
+                fr_range = lock.getForceRange()
                 print(
                     "Joint {name}: lock={lock_en} motor={motor_en} force=[{fr_low:.2e}, {fr_high:.2e}] curr={curr:.4f} -> target={target:.4f} damping={damping:.3f}".format(
                         name=name,
                         lock_en=lock.getEnable(),
                         motor_en=motor.getEnable(),
-                        fr_low=fr.lower(),
-                        fr_high=fr.upper(),
+                        fr_low=fr_range.lower(),
+                        fr_high=fr_range.upper(),
                         curr=current,
                         target=target,
                         damping=damping,
@@ -179,14 +297,333 @@ class JointController(agxSDK.StepEventListener):
                 )
 
 
+# ---------------------------------------------------------------------------
+# Scoring system configuration
+# ---------------------------------------------------------------------------
+SCORE_CONFIG = Struct(
+    {
+        "move_distance_threshold": 1.15,   # meters a particle must travel before being counted
+        "lift_height_gain": 1.25,          # required vertical gain (current_z - initial_z)
+        "check_interval": 0.5             # seconds between mass evaluations
+    }
+)
+
+SCORE_DATA = {
+    'start_time': None,
+    'end_time': None,
+    'max_height': 0.0,
+    'particles_moved': 0,
+    'total_mass_moved': 0.0,
+    'peak_mass': 0.0,
+    'initial_particle_positions': {},
+    'initial_particle_masses': {},
+    'samples_taken': 0
+}
+
+
+# Cached reference to the active granular system (set during scene build)
+GRANULAR_SYSTEM = None
+INITIAL_PARTICLE_TRANSFORMS = []
+
+
+def reset_score():
+    """Clear rolling score but keep configuration constants untouched."""
+    global SCORE_DATA
+    SCORE_DATA = {
+        'start_time': None,
+        'end_time': None,
+        'max_height': 0.0,
+        'particles_moved': 0,
+        'total_mass_moved': 0.0,
+        'peak_mass': 0.0,
+        'initial_particle_positions': {},
+        'initial_particle_masses': {},
+        'samples_taken': 0
+    }
+
+
+def reset_particles(granular_system=None):
+    """Restore granular bodies to their original spawn transforms."""
+    granular = granular_system or globals().get('GRANULAR_SYSTEM')
+    if granular is None:
+        print("[ParticleReset] skipped: no granular system registered")
+        return False
+    if not INITIAL_PARTICLE_TRANSFORMS:
+        print("[ParticleReset] skipped: no cached particle transforms")
+        return False
+
+    try:
+        total = len(INITIAL_PARTICLE_TRANSFORMS)
+        for idx, (pos, rot) in enumerate(INITIAL_PARTICLE_TRANSFORMS):
+            particle = granular.getParticle(idx) if hasattr(granular, 'getParticle') else granular.getGranularBody(idx)
+            if particle is None:
+                continue
+            try:
+                particle.setPosition(agx.Vec3(pos))
+            except Exception:
+                pass
+            try:
+                if hasattr(particle, 'setRotation'):
+                    particle.setRotation(agx.Quat(rot))
+            except Exception:
+                pass
+            try:
+                if hasattr(particle, 'setVelocity'):
+                    particle.setVelocity(agx.Vec3(0, 0, 0))
+                if hasattr(particle, 'setAngularVelocity'):
+                    particle.setAngularVelocity(agx.Vec3(0, 0, 0))
+            except Exception:
+                pass
+            try:
+                if hasattr(particle, 'setAwake'):
+                    particle.setAwake(True)
+            except Exception:
+                pass
+        print("[ParticleReset] restored {} particles".format(total))
+        return True
+    except Exception as exc:
+        print("[ParticleReset] failed: {}".format(exc))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Score tracking listener
+# ---------------------------------------------------------------------------
+class ScoreTracker(agxSDK.StepEventListener):
+    """Tracks mass of particles that are lifted by the excavator bucket."""
+
+    def __init__(self, granular_system, distance_threshold=None, lift_gain=None):
+        super().__init__()
+        self._granular = granular_system
+        self._distance_threshold = (
+            SCORE_CONFIG.move_distance_threshold if distance_threshold is None else distance_threshold
+        )
+        self._lift_gain = SCORE_CONFIG.lift_height_gain if lift_gain is None else lift_gain
+        self._check_interval = SCORE_CONFIG.check_interval
+        self._last_check = 0.0
+
+    # --- helpers -----------------------------------------------------------------
+    def _particle_count(self):
+        if not self._granular:
+            return 0
+        if hasattr(self._granular, 'getNumParticles'):
+            return self._granular.getNumParticles()
+        if hasattr(self._granular, 'getNumGranularBodies'):
+            return self._granular.getNumGranularBodies()
+        return 0
+
+    def _get_particle(self, index):
+        if not self._granular:
+            return None
+        if hasattr(self._granular, 'getParticle'):
+            return self._granular.getParticle(index)
+        if hasattr(self._granular, 'getGranularBody'):
+            return self._granular.getGranularBody(index)
+        return None
+
+    def _particle_mass(self, particle, index):
+        if particle is not None and hasattr(particle, 'getMass'):
+            return particle.getMass()
+        if hasattr(self._granular, 'getParticleMass'):
+            try:
+                return self._granular.getParticleMass(index)
+            except Exception:
+                return 0.0
+        if hasattr(self._granular, 'getGranularBodyMass'):
+            try:
+                return self._granular.getGranularBodyMass(index)
+            except Exception:
+                return 0.0
+        if index in SCORE_DATA['initial_particle_masses']:
+            return SCORE_DATA['initial_particle_masses'][index]
+        return 0.0
+
+    # --- main listener ------------------------------------------------------------
+    def pre(self, t):
+        global SCORE_DATA
+
+        # Initialize score tracking when digging starts
+        if SCORE_DATA['start_time'] is None:
+            jc = globals().get('JOINT_CONTROLLER')
+            if jc and hasattr(jc, '_pre_logged') and jc._pre_logged:
+                SCORE_DATA['start_time'] = t
+                # Capture initial particle positions and masses once at dig start
+                try:
+                    count = self._particle_count()
+                    if count:
+                        for i in range(count):
+                            particle = self._get_particle(i)
+                            if particle is None:
+                                continue
+                            SCORE_DATA['initial_particle_positions'][i] = agx.Vec3(particle.getPosition())
+                            SCORE_DATA['initial_particle_masses'][i] = self._particle_mass(particle, i)
+                        print("[ScoreTracker] captured {} particle baselines".format(len(SCORE_DATA['initial_particle_positions'])))
+                except Exception as e:
+                    print("[ScoreTracker] Failed to capture initial particle states:", e)
+
+        # Periodic score update
+        if t - self._last_check < self._check_interval:
+            return
+        self._last_check = t
+
+        if SCORE_DATA['start_time'] is None or not self._granular:
+            return
+
+        try:
+            moved_count = 0
+            lifted_mass = 0.0
+            max_height = SCORE_DATA['max_height']
+            count = self._particle_count()
+
+            for i in range(count):
+                particle = self._get_particle(i)
+                if particle is None:
+                    continue
+                current_pos = particle.getPosition()
+                baseline = SCORE_DATA['initial_particle_positions'].get(i)
+                if baseline is None:
+                    continue
+
+                disp_vec = current_pos - baseline
+                distance = disp_vec.length()
+                vertical_gain = current_pos.z() - baseline.z()
+
+                if distance > self._distance_threshold and vertical_gain > self._lift_gain:
+                    moved_count += 1
+                    lifted_mass += self._particle_mass(particle, i)
+                    if current_pos.z() > max_height:
+                        max_height = current_pos.z()
+
+            SCORE_DATA['particles_moved'] = moved_count
+            SCORE_DATA['total_mass_moved'] = lifted_mass
+            SCORE_DATA['max_height'] = max_height
+            SCORE_DATA['peak_mass'] = max(SCORE_DATA['peak_mass'], lifted_mass)
+            SCORE_DATA['samples_taken'] += 1
+
+        except Exception as e:
+            print("[ScoreTracker] Error updating score:", e)
+
+
+# ---------------------------------------------------------------------------
+# Minimal on-screen HUD (best-effort)
+# ---------------------------------------------------------------------------
+class HudUpdater(agxSDK.StepEventListener):
+    """
+    Tries to render simple on-screen text with current UI values.
+    If OSG text overlay creation fails, safely degrades to no-op.
+    """
+
+    def __init__(self, app, ui: UiState):
+        super().__init__()
+        self.ui = ui
+        self._ok = False
+        self._last = -1e9
+        self._interval = 0.25
+        self._decor = None
+        try:
+            # Screen-space decorator (camera anchored)
+            self._decor = app.getSceneDecorator() if app else None
+            # SceneDecorator in tutorials uses index-based setText(id, text, color)
+            if self._decor is not None and hasattr(self._decor, 'setText'):
+                self._ok = True
+            else:
+                self._ok = False
+        except Exception:
+            self._ok = False
+
+    def _bar(self, v, vmin, vmax, width=22):
+        try:
+            s = (float(v) - vmin) / max(1e-9, (vmax - vmin))
+        except Exception:
+            s = 0.0
+        s = max(0.0, min(1.0, s))
+        filled = int(round(s * width))
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+    def pre(self, t: float):
+        try:
+            if not self._ok:
+                return
+            if t - self._last < self._interval:
+                return
+            try:
+                mode = self.ui.apply_mode
+                fr = self.ui.force_range_base
+                s0 = "[Mode] {}   [A] Apply  [L] Toggle".format(mode)
+                s1 = "Friction: {:<24} {:.3f}  ([ / ])".format(
+                    self._bar(self.ui.friction, 0.0, 2.0), self.ui.friction
+                )
+                s2 = "Damping : {:<24} {:.3f}  ({{ / }})".format(
+                    self._bar(self.ui.damping, 0.0, 20.0), self.ui.damping
+                )
+                s3 = "Adhesion: {:<24} {:.1f}  (< / >)".format(
+                    self._bar(self.ui.adhesion, 0.0, 200.0), self.ui.adhesion
+                )
+                # force rangeは指数値のためバー表示は簡略化
+                fr_norm = min(1.0, max(0.0, (self.ui.force_range_base - 1.0e4) / (1.0e8 - 1.0e4)))
+                s4 = "Force   : {:<24} ±{:.1e}  (- / =)".format(
+                    self._bar(fr_norm, 0.0, 1.0), fr
+                )
+                s5 = "[E] Start  [P] Pause  [O] Resume  [R] Reset"
+                # Score display
+                if SCORE_DATA['start_time'] is not None:
+                    elapsed = t - SCORE_DATA['start_time']
+                    s6 = "Score: lift={:.1f}kg (peak {:.1f}) moved={} maxH={:.2f}m t={:.1f}s".format(
+                        SCORE_DATA['total_mass_moved'],
+                        SCORE_DATA['peak_mass'],
+                        SCORE_DATA['particles_moved'],
+                        SCORE_DATA['max_height'],
+                        elapsed
+                    )
+                else:
+                    s6 = "Score: Press [E] to start"
+                s7 = ""
+                texts = [s0, s1, s2, s3, s4, s5, s6, s7]
+                # Write to fixed slots 0..7 so it's always camera-anchored
+                for i, txt in enumerate(texts):
+                    try:
+                        # Prefer 2-arg signature; ignore color if unsupported
+                        try:
+                            self._decor.setText(i, txt)
+                        except TypeError:
+                            self._decor.setText(i, txt, agxRender.Color.White())
+                    except Exception:
+                        pass
+            finally:
+                self._last = t
+        except Exception as e:
+            print("[HUD.pre] error:", e)
+
+
+
 def start_automatic_digging(excavator):
     """
     Start an automatic digging process with pre-defined operations.
+    Builds the controller and stores it globally; actual simulation.add is deferred.
     """
 
-    print("Starting Automatic digging cycle")
+    print("[Start] begin (manual trigger)")
 
-    excavator.gamepad_controls = None
+    # Ensure built-in controls don't interfere
+    try:
+        excavator.gamepad_controls = None
+        print("[Start] gamepad controls disabled")
+    except Exception as e:
+        print("[Start] gamepad disable warn:", e)
+    try:
+        excavator.keyboard_controls = None
+        print("[Start] keyboard controls disabled")
+    except Exception as e:
+        print("[Start] keyboard disable warn:", e)
+
+    # Mark any existing controller as disposed (actual removal happens in DeferredStartListener)
+    try:
+        prev = globals().get('JOINT_CONTROLLER')
+        if prev is not None:
+            prev.dispose()
+            print("[Start] previous controller marked disposed")
+    except Exception as e:
+        print("[Start] dispose previous warn:", e)
 
     def digCycle(start_time, arm_height, cabin_start):
         """
@@ -227,38 +664,30 @@ def start_automatic_digging(excavator):
         StepEventCallback.callIn(start + duration, lambda: set_speed(0))
 
     poses = []
-    time = 0
-    poses.extend(digCycle(0.5, 0.01, 0))
-    time = 0.5
+    poses.extend(digCycle(0.0, 0.01, 0))  # start immediately on E
 
-    print("Total cycle time: ", time)
+    print("[Start] creating controller")
 
     joint_controller = JointController(excavator, poses)
 
     # Setup all the events for all the digging cycles
     for p in poses:
         time = p[0]
-        i = 0
         for name in p[1]:
-            i += 1
             val = p[1][name]
-            arg = [name, val]
-            print(
-                "Scheduling joint '{}' -> {:.3f} at sim t + {:.3f}".format(
-                    name, val, time
-                )
-            )
-            # Schedule a future callback so the joint controller receives targets exactly when we want motion to start.
-            StepEventCallback.callIn(
-                time, lambda arg=arg: joint_controller.set_target(arg[0], arg[1])
-            )
+            if time <= 0.0:
+                # Immediate application on E press
+                joint_controller.set_target(name, val)
+                print("[Start] applied '{}' -> {:.3f} immediately".format(name, val))
+            else:
+                arg = [name, val]
+                print("[Start] scheduling '{}' -> {:.3f} at +{:.3f}s".format(name, val, time))
+                StepEventCallback.callIn(time, lambda arg=arg: joint_controller.set_target(arg[0], arg[1]))
 
-    simulation().add(joint_controller)
-    print(
-        "JointController added to simulation at t={:.3f}".format(
-            simulation().getTimeStamp()
-        )
-    )
+    # Store controller globally; DeferredStartListener will add to sim
+    globals()["JOINT_CONTROLLER"] = joint_controller
+    globals()["EXCAVATOR"] = excavator
+    print("[Start] controller ready for sim.add")
 
 
 def create_box(size, thickness):
@@ -326,6 +755,7 @@ def create_particles(particle_spec, ground_material, spawn_box):
     # Create and configure the particle system.
     granularBodySystem = agx.GranularBodySystem()
     simulation().add(granularBodySystem)
+    globals()['GRANULAR_SYSTEM'] = granularBodySystem
 
     simulation().getDynamicsSystem().getSolver().setUseParallelPgs(True)
 
@@ -365,7 +795,21 @@ def create_particles(particle_spec, ground_material, spawn_box):
         0.3 * granularBodySystem.getParticleRadius(),
     )
     agxOSG.createVisual(granularBodySystem, root())
-    return particle_material
+    try:
+        count = granularBodySystem.getNumParticles() if hasattr(granularBodySystem, 'getNumParticles') else granularBodySystem.getNumGranularBodies()
+        print("[Granular] spawned {} particles".format(count))
+        transforms = []
+        for i in range(count):
+            particle = granularBodySystem.getParticle(i) if hasattr(granularBodySystem, 'getParticle') else granularBodySystem.getGranularBody(i)
+            if particle is None:
+                continue
+            transforms.append((agx.Vec3(particle.getPosition()), agx.Quat(particle.getRotation())))
+        globals()['INITIAL_PARTICLE_TRANSFORMS'] = transforms
+        print("[Granular] cached {} initial particle transforms".format(len(transforms)))
+    except Exception as exc:
+        print("[Granular] warning: failed to cache initial particle transforms - {}".format(exc))
+    return particle_material, granularBodySystem
+    
 
 
 def configure_bucket_collisions(bucket_body):
@@ -374,7 +818,7 @@ def configure_bucket_collisions(bucket_body):
     """
 
     bucket_materials = []
-    seen_ids = set()
+    seen_names = set()
     geoms = bucket_body.getGeometries()
     for geom in geoms:
         name = geom.getName() or "<unnamed>"
@@ -393,8 +837,12 @@ def configure_bucket_collisions(bucket_body):
         )
         if target_state:
             material = geom.getMaterial()
-            if material is not None and id(material) not in seen_ids:
-                seen_ids.add(id(material))
+            try:
+                mname = material.getName() if material is not None else None
+            except Exception:
+                mname = None
+            if material is not None and mname not in seen_names:
+                seen_names.add(mname)
                 bucket_materials.append(material)
     return bucket_materials
 
@@ -404,25 +852,144 @@ def configure_particle_bucket_contact(particle_material, bucket_materials, spec)
     if not bucket_materials:
         print("No bucket materials detected for contact configuration.")
         return
-    for bucket_material in bucket_materials:
+    # Deduplicate by material name to avoid repeated reconfiguration spam
+    unique_buckets = []
+    seen_names = set()
+    for bm in bucket_materials:
+        try:
+            name = bm.getName()
+        except Exception:
+            name = None
+        if name not in seen_names:
+            seen_names.add(name)
+            unique_buckets.append(bm)
+
+    for bucket_material in unique_buckets:
         contact = manager.getOrCreateContactMaterial(particle_material, bucket_material)
         set_contact_material(spec, contact)
-        print(
-            "Configured contact: particles='{}', bucket='{}'".format(
-                particle_material.getName(), bucket_material.getName()
-            )
+
+    # Single compact log line
+    try:
+        names = [bm.getName() for bm in unique_buckets]
+    except Exception:
+        names = ["<bucket>"]
+    print(
+        "Configured particle-bucket contact for {} unique bucket materials: {}".format(
+            len(unique_buckets), ", ".join(names)
         )
-        print("  Young's modulus: {:.3e}".format(spec.youngs_modulus))
-        print("  Friction coefficient: {:.3f}".format(spec.friction_coefficient))
-        print("  Rolling resistance: {:.3f}".format(spec.rolling_coefficient))
-        print("  Damping: {:.3f}".format(spec.damping))
-        if hasattr(spec, "adhesion") and hasattr(spec, "adhesive_overlap"):
-            print(
-                "  Adhesion: {:.3f} (overlap {:.4f})".format(
-                    spec.adhesion, spec.adhesive_overlap
-                )
-            )
-        print("  Restitution: {:.3f}".format(spec.restitution))
+    )
+    print(
+        "  Params: E={:.3e}, mu={:.3f}, roll={:.3f}, damp={:.3f}, rest={:.3f}{}".format(
+            spec.youngs_modulus,
+            spec.friction_coefficient,
+            spec.rolling_coefficient,
+            spec.damping,
+            spec.restitution,
+            (
+                ", adhesion={:.3f}@{:.4f}".format(spec.adhesion, spec.adhesive_overlap)
+                if hasattr(spec, "adhesion") and hasattr(spec, "adhesive_overlap")
+                else ""
+            ),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# PARAMETER BINDER (Sprint 1 minimal)
+# ---------------------------------------------------------------------------
+class ParameterBinder:
+    """
+    UiState -> AGX 反映係。Sprint1では以下のみ対応:
+      - 粒子接触の friction/damping/restitution を更新
+      - ジョイント Lock1D の force range を更新
+      - Live モード時はデバウンス付きで反映
+    """
+
+    def __init__(self, sim):
+        self._sim = sim
+        self.particle_material = None
+        self.ground_material = None
+        self.bucket_materials = []
+        self.excavator = None
+        self.last_applied = UI_STATE.clone()
+        self._last_apply_time = -1e9
+        self.live_debounce = 0.1  # [s]
+
+    def attach_scene(self, particle_material, ground_material, bucket_materials, excavator):
+        self.particle_material = particle_material
+        self.ground_material = ground_material
+        self.bucket_materials = list(bucket_materials or [])
+        self.excavator = excavator
+
+    # ---- contacts ----
+    def _apply_contact_between(self, m1, m2, ui):
+        if m1 is None or m2 is None:
+            return
+        cm = self._sim.getMaterialManager().getOrCreateContactMaterial(m1, m2)
+        # 既存のYoungs等は保持し、UIで指定された項目のみ更新
+        try:
+            cm.setFrictionCoefficient(float(ui.friction))
+            cm.setDamping(float(ui.damping))
+            cm.setRestitution(float(ui.restitution))
+            # Adhesionの設定
+            if hasattr(cm, 'setAdhesion'):
+                cm.setAdhesion(float(ui.adhesion), PARTICLE_BUCKET_CONTACT.adhesive_overlap)
+        except Exception as e:
+            print("Contact update warning:", e)
+
+    def apply_contacts(self, ui: UiState):
+        if self.particle_material is None:
+            return
+        # particle-particle
+        self._apply_contact_between(self.particle_material, self.particle_material, ui)
+        # particle-ground
+        if self.ground_material is not None:
+            self._apply_contact_between(self.particle_material, self.ground_material, ui)
+        # particle-bucket (複数材)
+        for bm in (self.bucket_materials or []):
+            self._apply_contact_between(self.particle_material, bm, ui)
+    # ---- joints ----
+    def effective_force_range(self):
+        # APPLY時は last_applied を、LIVE時は UI の現値を使う
+        src = self.last_applied if UI_STATE.apply_mode.upper() == 'APPLY' else UI_STATE
+        return src.force_range()
+
+    def apply_joints(self, ui: UiState):
+        # JOINT_CONTROLLER が存在すれば各 Lock1D に force range を設定
+        jc = globals().get("JOINT_CONTROLLER")
+        if jc is None:
+            return
+        fr = ui.force_range()
+        for name, constraint in jc.constraints.items():
+            try:
+                lock = constraint.getLock1D()
+                lock.setForceRange(fr)
+            except Exception as e:
+                print("Joint update warning ({}):".format(name), e)
+
+    # ---- all ----
+    def apply_all(self, ui: UiState):
+        self.apply_contacts(ui)
+        self.apply_joints(ui)
+        self.last_applied = ui.clone()
+
+
+class UiApplierListener(agxSDK.StepEventListener):
+    def __init__(self, binder: ParameterBinder):
+        super().__init__()
+        self._binder = binder
+        self._last = -1e9
+
+    def pre(self, time: float):
+        try:
+            if UI_STATE.apply_mode.upper() != 'LIVE':
+                return
+            # デバウンス: live_debounce 秒ごと
+            if time - self._last >= max(0.05, self._binder.live_debounce):
+                self._binder.apply_all(UI_STATE)
+                self._last = time
+        except Exception as e:
+            print("[UiApplierListener.pre] error:", e)
 
 
 def prepare_excavator_bodies(excavator):
@@ -443,6 +1010,101 @@ def prepare_excavator_bodies(excavator):
             body.wakeup()
     # Without this wake-up pass the physics engine might leave parts asleep and ignore our commands.
     print("Excavator bodies prepared: {} bodies woken".format(len(bodies)))
+
+# --- initial state capture/restore helpers ---
+INITIAL_EXCAVATOR_POS = None
+INITIAL_JOINT_ANGLES = None
+INITIAL_BODY_TRANSFORMS = {}
+
+def get_excavator_constraints(excavator):
+    cons = collections.OrderedDict()
+    try:
+        cons["cabin"] = excavator.cabin_hinge
+        cons["bucket"] = excavator.bucket_prismatic
+        cons["stick"] = excavator.stick_prismatic
+        cons["arm"] = excavator.arm_prismatics[1]
+    except Exception:
+        pass
+    return cons
+
+def capture_initial_excavator_state(excavator):
+    global INITIAL_EXCAVATOR_POS, INITIAL_JOINT_ANGLES, INITIAL_BODY_TRANSFORMS
+    try:
+        INITIAL_EXCAVATOR_POS = agx.Vec3(excavator.getPosition()) if hasattr(excavator, 'getPosition') else agx.Vec3(-2,0,0)
+    except Exception:
+        INITIAL_EXCAVATOR_POS = agx.Vec3(-2,0,0)
+    
+    # Capture all body transforms
+    INITIAL_BODY_TRANSFORMS = {}
+    try:
+        for body in list(excavator.getRigidBodies()):
+            if body:
+                name = body.getName()
+                INITIAL_BODY_TRANSFORMS[name] = {
+                    'position': agx.Vec3(body.getPosition()),
+                    'rotation': agx.Quat(body.getRotation())
+                }
+    except Exception as e:
+        print("[Capture] Failed to capture body transforms:", e)
+    
+    # Capture joint angles
+    INITIAL_JOINT_ANGLES = collections.OrderedDict()
+    cons = get_excavator_constraints(excavator)
+    for name, c in cons.items():
+        try:
+            INITIAL_JOINT_ANGLES[name] = c.getAngle()
+        except Exception:
+            INITIAL_JOINT_ANGLES[name] = 0.0
+
+def apply_initial_excavator_state(excavator):
+    print("[Reset] Restoring initial excavator state...")
+    
+    # Reset all body transforms
+    try:
+        for body in list(excavator.getRigidBodies()):
+            if body:
+                name = body.getName()
+                if name in INITIAL_BODY_TRANSFORMS:
+                    transform = INITIAL_BODY_TRANSFORMS[name]
+                    body.setPosition(transform['position'])
+                    body.setRotation(transform['rotation'])
+                    body.setVelocity(agx.Vec3(0,0,0))
+                    body.setAngularVelocity(agx.Vec3(0,0,0))
+                    if hasattr(body, 'setAwake'):
+                        body.setAwake(True)
+        print("[Reset] Body transforms restored")
+    except Exception as e:
+        print("[Reset] Failed to restore body transforms:", e)
+        import traceback
+        traceback.print_exc()
+    
+    # Reset base position
+    try:
+        if INITIAL_EXCAVATOR_POS is not None and hasattr(excavator, 'setPosition'):
+            excavator.setPosition(INITIAL_EXCAVATOR_POS)
+    except Exception:
+        pass
+    
+    # Reset joint locks to initial angles
+    cons = get_excavator_constraints(excavator)
+    for name, c in cons.items():
+        try:
+            lock = c.getLock1D()
+            motor = c.getMotor1D()
+            if motor: motor.setEnable(False)
+            if lock:
+                lock.setEnable(True)
+                angle = INITIAL_JOINT_ANGLES.get(name, 0.0) if INITIAL_JOINT_ANGLES else 0.0
+                lock.setPosition(angle)
+                try:
+                    lock.setForceRange(UI_STATE.force_range())
+                    lock.setDamping(0.3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
+    print("[Reset] Initial state applied")
 
 
 def buildScene1():
@@ -537,7 +1199,7 @@ def buildScene1():
 
     spawn_box = agx.Bound3(lower, upper)
 
-    particle_material = create_particles(particle_specification, ground_material, spawn_box)
+    particle_material, granular_system = create_particles(particle_specification, ground_material, spawn_box)
 
     keyboard_controls = Excavator.default_keyboard_settings()
     gamepad_controls = Excavator.default_gamepad_controls()
@@ -549,6 +1211,9 @@ def buildScene1():
     excavator.setPosition(-2, 0, 0)
     simulation().add(excavator)
     prepare_excavator_bodies(excavator)
+    
+    # Capture initial state for reset
+    capture_initial_excavator_state(excavator)
 
     # Ensure the detailed mesh geometries handle particle contact while helper boxes stay disabled.
     bucket_materials = configure_bucket_collisions(excavator.bucket_body)
@@ -558,13 +1223,197 @@ def buildScene1():
         PARTICLE_BUCKET_CONTACT,
     )
 
-    # Bind a keyboard button for starting the automatic digging cycle
-    Input.bind(
-        name="Automatic Digging",
-        key=ord("2"),
-        mode=Input.Mode.NATIVE,
-        callback=lambda data: start_automatic_digging(excavator),
+    # --- Parameter binder setup (Sprint1) ---
+    global PARAM_BINDER
+    PARAM_BINDER = ParameterBinder(simulation())
+    PARAM_BINDER.attach_scene(
+        particle_material=particle_material,
+        ground_material=ground_material,
+        bucket_materials=bucket_materials,
+        excavator=excavator,
     )
+    # Live適用用のStepEventListenerを登録（LIVEモード時のみ反映）
+    simulation().add(UiApplierListener(PARAM_BINDER))
+
+    # Global flags for E/R key presses
+    E_KEY_PRESSED = [False]
+    R_KEY_PRESSED = [False]
+    R_RESET_PARTICLES = [False]
+    SHIFT_ANY_DOWN = [False]
+    SHIFT_HELD = {'left': False, 'right': False}
+    
+    # Simple callbacks that set flags
+    def _on_e_key(_):
+        E_KEY_PRESSED[0] = True
+        print("[Callback] E key pressed, flag set")
+    
+    def _on_r_key(data):
+        if not getattr(data, 'isKeyDown', True):
+            return
+        R_KEY_PRESSED[0] = True
+        R_RESET_PARTICLES[0] = SHIFT_ANY_DOWN[0]
+        suffix = " (with particles)" if R_RESET_PARTICLES[0] else ""
+        print("[Callback] R key pressed, flag set{}".format(suffix))
+
+    def _update_shift(data, key_name):
+        is_down = getattr(data, 'down', False)
+        SHIFT_HELD[key_name] = bool(is_down)
+        SHIFT_ANY_DOWN[0] = SHIFT_HELD['left'] or SHIFT_HELD['right']
+
+    def _on_shift_left(data):
+        _update_shift(data, 'left')
+
+    def _on_shift_right(data):
+        _update_shift(data, 'right')
+    
+    # Use keyboard polling directly in StepEventListener
+    class DeferredStartListener(agxSDK.StepEventListener):
+        def __init__(self, exc, e_flag, r_flag, r_particles_flag, granular):
+            super().__init__()
+            self._exc = exc
+            self._e_flag = e_flag
+            self._r_flag = r_flag
+            self._r_particles_flag = r_particles_flag
+            self._granular = granular
+            self._controller_added = False
+            self._call_count = 0
+        
+        def pre(self, t):
+            self._call_count += 1
+            # Debug: periodically report that pre() is being called
+            if self._call_count % 300 == 1:
+                print("[DeferredListener] pre() called {} times, e_flag={}, r_flag={}".format(
+                    self._call_count, self._e_flag[0], self._r_flag[0]))
+            
+            # Check E key (start digging)
+            if self._e_flag[0]:
+                self._e_flag[0] = False
+                print("[E] pressed at t={:.3f}".format(t))
+                try:
+                    # First remove any old controller
+                    prev = globals().get('JOINT_CONTROLLER')
+                    if prev is not None and not getattr(prev, '_disposed', False):
+                        try:
+                            simulation().remove(prev)
+                            print("[DeferredStart] removed old controller")
+                        except Exception:
+                            pass
+                    # Reset score data for new dig cycle
+                    reset_score()
+                    # Build new controller (this sets globals JOINT_CONTROLLER)
+                    start_automatic_digging(self._exc)
+                    # Now add it to simulation
+                    jc = globals().get('JOINT_CONTROLLER')
+                    if jc is not None:
+                        simulation().add(jc)
+                        print("[DeferredStart] controller added to sim at t={:.3f}".format(t))
+                        self._controller_added = True
+                except Exception as e:
+                    print("[DeferredStart] error:", e)
+                    import traceback
+                    traceback.print_exc()
+            
+            # Check R key (reset)
+            if self._r_flag[0]:
+                self._r_flag[0] = False
+                print("[R] pressed at t={:.3f}".format(t))
+                try:
+                    sim = simulation()
+                    jc = globals().get('JOINT_CONTROLLER')
+                    if jc:
+                        jc.dispose()
+                        sim.remove(jc)
+                        globals()['JOINT_CONTROLLER'] = None
+                    # Restore excavator to initial position and joint angles
+                    exc = globals().get('EXCAVATOR')
+                    if exc:
+                        apply_initial_excavator_state(exc)
+                        # Re-create idle controller with no scheduled moves
+                        controller = JointController(exc, [])
+                        globals()['JOINT_CONTROLLER'] = controller
+                        sim.add(controller)
+                    particles_reset = False
+                    if self._r_particles_flag[0]:
+                        particles_reset = reset_particles(self._granular)
+                    # Reset score data
+                    reset_score()
+                    # NOTE: UI_STATEはリセットしない（ユーザーが調整した値を保持）
+                    print('[DeferredReset] executed -> True (particles reset={})'.format(particles_reset))
+                except Exception as e:
+                    print('[DeferredReset] failed:', e)
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    self._r_particles_flag[0] = False
+    
+    # DeferredStartListener will be added after app is ready (below)
+    simulation().add(DeferredStartListener(excavator, E_KEY_PRESSED, R_KEY_PRESSED, R_RESET_PARTICLES, granular_system))
+
+    # --- Minimal keyboard HUD controls (placeholder before OSG widgets) ---
+    def _apply(_):
+        ok = False
+        try:
+            if PARAM_BINDER:
+                PARAM_BINDER.apply_all(UI_STATE)
+                ok = True
+        except Exception as e:
+            print("[Apply] failed:", e)
+            ok = False
+        print("[Apply] executed -> {}  (fric={:.3f} damp={:.3f} rest={:.3f} adh={:.1f} force=±{:.1e})".format(
+            ok, UI_STATE.friction, UI_STATE.damping, UI_STATE.restitution, UI_STATE.adhesion, UI_STATE.force_range_base
+        ))
+
+    def _toggle_live(_):
+        try:
+            UI_STATE.apply_mode = 'LIVE' if UI_STATE.apply_mode.upper() == 'APPLY' else 'APPLY'
+            print("[Mode] toggled -> {}".format(UI_STATE.apply_mode))
+            print("[Mode] executed -> True")
+        except Exception as e:
+            print("[Mode] toggle failed:", e)
+            print("[Mode] executed -> False")
+
+    def _friction_up(_):
+        UI_STATE.friction = min(2.0, UI_STATE.friction + 0.05)
+        print("friction=", UI_STATE.friction)
+
+    def _friction_down(_):
+        UI_STATE.friction = max(0.0, UI_STATE.friction - 0.05)
+        print("friction=", UI_STATE.friction)
+
+    def _damping_up(_):
+        UI_STATE.damping = min(20.0, UI_STATE.damping + 0.2)
+        print("damping=", UI_STATE.damping)
+
+    def _damping_down(_):
+        UI_STATE.damping = max(0.0, UI_STATE.damping - 0.2)
+        print("damping=", UI_STATE.damping)
+
+    def _adhesion_up(_):
+        UI_STATE.adhesion = min(200.0, UI_STATE.adhesion + 5.0)
+        print("adhesion=", UI_STATE.adhesion)
+
+    def _adhesion_down(_):
+        UI_STATE.adhesion = max(0.0, UI_STATE.adhesion - 5.0)
+        print("adhesion=", UI_STATE.adhesion)
+
+    def _force_up(_):
+        UI_STATE.force_range_base = min(1.0e8, UI_STATE.force_range_base * 1.25)
+        print("force_range=±{:.1e}".format(UI_STATE.force_range_base))
+
+    def _force_down(_):
+        UI_STATE.force_range_base = max(1.0e4, UI_STATE.force_range_base / 1.25)
+        print("force_range=±{:.1e}".format(UI_STATE.force_range_base))
+
+    Input.bind(name="Apply", key=ord('A'), mode=Input.Mode.NATIVE, callback=_apply)
+    Input.bind(name="Toggle Live", key=ord('L'), mode=Input.Mode.NATIVE, callback=_toggle_live)
+    Input.bind(name="Friction +", key=ord(']'), mode=Input.Mode.NATIVE, callback=_friction_up)
+    Input.bind(name="Friction -", key=ord('['), mode=Input.Mode.NATIVE, callback=_friction_down)
+    Input.bind(name="Damping +", key=ord('}'), mode=Input.Mode.NATIVE, callback=_damping_up)
+    Input.bind(name="Damping -", key=ord('{'), mode=Input.Mode.NATIVE, callback=_damping_down)
+    Input.bind(name="Adhesion +", key=ord('>'), mode=Input.Mode.NATIVE, callback=_adhesion_up)
+    Input.bind(name="Adhesion -", key=ord('<'), mode=Input.Mode.NATIVE, callback=_adhesion_down)
+    Input.bind(name="Force +", key=ord('='), mode=Input.Mode.NATIVE, callback=_force_up)
+    Input.bind(name="Force -", key=ord('-'), mode=Input.Mode.NATIVE, callback=_force_down)
 
     # Configure the contact material between the tracks and the ground(terrain)
     excavator.configure_track_ground_contact_materials(ground)
@@ -590,8 +1439,14 @@ def buildScene1():
     # Enable warm starting of contacts
     simulation().getDynamicsSystem().setEnableContactWarmstarting(True)
 
-    setup_camera(application())
-    # createHelpText(simulation(), application())
+    app = application()
+    setup_camera(app)
+    
+    # On-screen help text / mini HUD
+    try:
+        simulation().add(HudUpdater(app, UI_STATE))
+    except Exception as e:
+        print("HUD init failed:", e)
 
     simulation().setTimeStep(particle_specification.time_step)
     print(
@@ -600,19 +1455,73 @@ def buildScene1():
         )
     )
 
-    # Delay the automatic digging so the granular bed can settle before motion begins.
-    print("Automatic digging scheduled after {:.2f} s".format(START_DELAY))
+    # Manual start only (E key), remove automatic scheduling.
+    print("Manual start: press 'E' to begin digging cycle (no auto delay).")
 
-    def delayed_digging_start():
-        print(
-            "Automatic digging trigger fired at t={:.3f}".format(
-                simulation().getTimeStamp()
-            )
-        )
-        start_automatic_digging(excavator)
+    # ---- Stats listener (lightweight) ----
+    class StatsListener(agxSDK.StepEventListener):
+        def __init__(self, granular_system):
+            super().__init__()
+            self._last = -1e9
+            self._granular = granular_system
+            self._interval = 0.5
+        def pre(self, t):
+            if t - self._last < self._interval:
+                return
+            sim = simulation()
+            dt = sim.getTimeStep()
+            solver = sim.getDynamicsSystem().getSolver()
+            particles = 0
+            try:
+                if self._granular:
+                    if hasattr(self._granular, 'getNumParticles'):
+                        particles = self._granular.getNumParticles()
+                    elif hasattr(self._granular, 'getNumGranularBodies'):
+                        particles = self._granular.getNumGranularBodies()
+            except Exception:
+                pass
+            # FPS は近似: 1/dt（固定ステップ前提）
+            fps = 1.0 / dt if dt > 0 else 0
+            print("[Stats] t={:.2f} fps≈{:.1f} particles={} dt={:.5f} restIters={}".format(
+                sim.getTimeStamp(), fps, particles, dt, solver.getNumRestingIterations()
+            ))
+            self._last = t
 
-    # Tell AGX to run the digging macro once the particles have settled for a few seconds.
-    StepEventCallback.callAt(START_DELAY, delayed_digging_start)
+    if granular_system is None:
+        granular_system = globals().get('GRANULAR_SYSTEM')
+    simulation().add(StatsListener(granular_system))
+
+    # Add score tracker (after granular_system is obtained)
+    simulation().add(ScoreTracker(granular_system))
+
+    # ---- Pause/Resume now handled via Input.bind (can keep for P/O) ----
+    def _pause(_):
+        ok = False
+        try:
+            jc = globals().get('JOINT_CONTROLLER')
+            if jc:
+                jc.pause(); ok = True
+        except Exception as e:
+            print('[Pause] failed:', e)
+        print('[Pause] executed -> {}'.format(ok))
+    def _resume(_):
+        ok = False
+        try:
+            jc = globals().get('JOINT_CONTROLLER')
+            if jc:
+                jc.resume(); ok = True
+        except Exception as e:
+            print('[Resume] failed:', e)
+        print('[Resume] executed -> {}'.format(ok))
+    
+    # Bind E and R keys to set flags
+    Input.bind(name='StartDigging', key=ord('E'), mode=Input.Mode.NATIVE, callback=_on_e_key)
+    Input.bind(name='ResetExcavator', key=ord('R'), mode=Input.Mode.NATIVE, callback=_on_r_key)
+    Input.bind(name='ShiftLeft', key=agxSDK.GuiEventListener.KEY_Shift_L, mode=Input.Mode.NATIVE, callback=_on_shift_left)
+    Input.bind(name='ShiftRight', key=agxSDK.GuiEventListener.KEY_Shift_R, mode=Input.Mode.NATIVE, callback=_on_shift_right)
+    # P/O remain for pause/resume
+    Input.bind(name='Pause', key=ord('P'), mode=Input.Mode.NATIVE, callback=_pause)
+    Input.bind(name='Resume', key=ord('O'), mode=Input.Mode.NATIVE, callback=_resume)
 
 
 def buildScene():
