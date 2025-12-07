@@ -1,0 +1,101 @@
+Title: Adjust Excavator Evaluation Interval and Operation Timing for Realistic Behavior
+Date: 2025-12-07
+
+Summary
+- Adjusted evaluation interval from 0.5 seconds to 2.0 seconds to match realistic excavator operation cycles
+- Extended digging cycle timing from 7 seconds total to 15 seconds total to reflect actual machine behavior
+- Added documentation about force/torque control parameters for ML training considerations
+- Changes applied across all test files (test1.agxPy, test2.agxPy, test3.agxPy)
+
+Background / Problem Statement
+The user identified that the current simulation was evaluating excavator performance every 2 seconds (referring to the operation intervals in the digging cycle), which is too fast compared to real excavator operations. This could lead to:
+1. ML agents learning to apply excessive torque to meet unrealistic timing constraints
+2. Simulation behavior that doesn't match real-world excavator operation patterns
+3. Training results that wouldn't transfer well to actual excavator control
+
+Changes Made
+
+1. Score Evaluation Interval (SCORE_CONFIG.check_interval)
+   - Before: 0.5 seconds between mass evaluations
+   - After: 2.0 seconds between mass evaluations
+   - Rationale: Matches more realistic inspection/evaluation cycles for excavator operations
+   - Files: test1.agxPy, test3.agxPy
+
+2. Digging Cycle Timing (digCycle function)
+   Extended all operation timings to reflect realistic excavator movement speeds:
+   - Arm down: 2s → 4s
+   - Stick extend: 2s → 5s  
+   - Bucket close: 3s → 7s
+   - Arm lift: 6s → 12s
+   - Bucket open: 7s → 14s
+   - Arm extend: 7s → 15s
+   
+   Total cycle duration: 7 seconds → 15 seconds
+   Files: test1.agxPy, test2.agxPy, test3.agxPy
+
+3. HUD Update Interval
+   - Before: 0.25 seconds
+   - After: 0.5 seconds
+   - Rationale: Reduced update frequency matches the slower operation cycle
+   - Files: test3.agxPy
+
+4. Documentation Added
+   Added explanatory comments near LOCK_FORCE_RANGE definition:
+   "Force/Torque control parameters
+    Note: These values should reflect realistic excavator hydraulic capabilities.
+    For ML training, ensure evaluation intervals and movement timing allow the agent
+    to learn realistic torque patterns rather than requiring excessive force to meet
+    unrealistic timing constraints."
+   Files: test1.agxPy, test3.agxPy
+
+Benefits of These Changes
+
+1. Realistic Torque Learning
+   - ML agents will learn torque patterns that match actual excavator capabilities
+   - Reduced risk of training agents that rely on excessive force
+
+2. Better Simulation Fidelity
+   - Operation timing matches real excavator movement speeds
+   - More realistic for testing and validation
+
+3. Improved Training Outcomes
+   - Learned behaviors should transfer better to real excavators
+   - Agents won't be penalized for operating within realistic physical constraints
+
+How to Validate
+
+1. Run any of the test files:
+   agxviewer test3.agxPy
+
+2. Observe the digging cycle:
+   - Press 'E' to start automatic digging
+   - Movement should appear more deliberate and realistic
+   - Full cycle should take approximately 15 seconds instead of 7
+
+3. Check score updates:
+   - Score should update every 2 seconds instead of 0.5 seconds
+   - HUD should refresh every 0.5 seconds
+
+4. For ML training:
+   - Train agents with the new timing parameters
+   - Compare learned torque profiles with the previous version
+   - Verify that torque requirements are within realistic bounds (±1.0e6 range)
+
+Future Considerations
+
+1. Fine-tuning may be needed based on:
+   - Specific excavator model being simulated
+   - Soil/material properties
+   - Task requirements (speed vs precision tradeoffs)
+
+2. Consider making timing parameters configurable via UI or config file for easier experimentation
+
+3. May want to add telemetry to track actual torque usage during operations to ensure it stays within realistic ranges
+
+4. For different excavator sizes or types, timing parameters may need adjustment
+
+Notes
+- These changes maintain backward compatibility with existing simulation features
+- No changes to physics parameters or contact materials
+- Keyboard controls and UI remain unchanged
+- The evaluation logic itself is unchanged, only the timing intervals
