@@ -50,6 +50,11 @@ PARTICLE_BUCKET_CONTACT = Struct(
     }
 )
 
+# Force/Torque control parameters
+# Note: These values should reflect realistic excavator hydraulic capabilities.
+# For ML training, ensure evaluation intervals and movement timing allow the agent
+# to learn realistic torque patterns rather than requiring excessive force to meet
+# unrealistic timing constraints.
 LOCK_FORCE_RANGE = agx.RangeReal(-1.0e6, 1.0e6)
 LOCK_DAMPING_MIN = 0.1
 LOCK_DAMPING_MAX = 0.6
@@ -304,7 +309,7 @@ SCORE_CONFIG = Struct(
     {
         "move_distance_threshold": 1.15,   # meters a particle must travel before being counted
         "lift_height_gain": 1.25,          # required vertical gain (current_z - initial_z)
-        "check_interval": 0.5             # seconds between mass evaluations
+        "check_interval": 2.0              # seconds between mass evaluations (realistic excavator operation interval)
     }
 )
 
@@ -627,18 +632,20 @@ def start_automatic_digging(excavator):
 
     def digCycle(start_time, arm_height, cabin_start):
         """
-        Creates a number of poses that together form a digging cycle
+        Creates a number of poses that together form a digging cycle.
+        Timing adjusted to reflect realistic excavator operation speeds,
+        reducing torque requirements and matching actual machine behavior.
         """
         return [
             [start_time + 0, {"cabin": cabin_start + 0.0}],
             [start_time + 0, {"stick": -0.4}],
             [start_time + 0, {"bucket": -0.9}],
-            [start_time + 2, {"arm": arm_height - 0.2}],
-            [start_time + 2, {"stick": 0.6}],
-            [start_time + 3, {"bucket": 0.0}],
-            [start_time + 6, {"arm": arm_height + 0.5}],
-            [start_time + 7, {"bucket": 0.2}],
-            [start_time + 7, {"arm": arm_height + 1}],
+            [start_time + 4, {"arm": arm_height - 0.2}],      # Extended from 2s to 4s
+            [start_time + 5, {"stick": 0.6}],                # Extended from 2s to 5s
+            [start_time + 7, {"bucket": 0.0}],               # Extended from 3s to 7s
+            [start_time + 12, {"arm": arm_height + 0.5}],    # Extended from 6s to 12s
+            [start_time + 14, {"bucket": 0.2}],              # Extended from 7s to 14s
+            [start_time + 15, {"arm": arm_height + 1}],      # Extended from 7s to 15s
         ]
 
     def set_speed(speed):
