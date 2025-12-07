@@ -128,18 +128,20 @@ def start_automatic_digging(excavator):
 
     def digCycle(start_time, arm_height, cabin_start):
         """
-        Creates a number of poses that together form a digging cycle
+        Creates a number of poses that together form a digging cycle.
+        Timing adjusted to reflect realistic excavator operation speeds,
+        reducing torque requirements and matching actual machine behavior.
         """
         return [
             [start_time + 0, {"cabin": cabin_start + 0.0}],
             [start_time + 0, {"stick": -0.4}],
             [start_time + 0, {"bucket": -0.9}],
-            [start_time + 2, {"arm": arm_height - 0.2}],
-            [start_time + 2, {"stick": 0.6}],
-            [start_time + 3, {"bucket": 0.0}],
-            [start_time + 6, {"arm": arm_height + 0.5}],
-            [start_time + 7, {"bucket": 0.2}],
-            [start_time + 7, {"arm": arm_height + 1}],
+            [start_time + 4, {"arm": arm_height - 0.2}],      # Extended from 2s to 4s
+            [start_time + 5, {"stick": 0.6}],                # Extended from 2s to 5s
+            [start_time + 7, {"bucket": 0.0}],               # Extended from 3s to 7s
+            [start_time + 12, {"arm": arm_height + 0.5}],    # Extended from 6s to 12s
+            [start_time + 14, {"bucket": 0.2}],              # Extended from 7s to 14s
+            [start_time + 15, {"arm": arm_height + 1}],      # Extended from 7s to 15s
         ]
 
     def set_speed(speed):
