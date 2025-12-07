@@ -8,7 +8,7 @@ Summary
 - Changes applied across all test files (test1.agxPy, test2.agxPy, test3.agxPy)
 
 Background / Problem Statement
-The user identified that the current simulation was evaluating excavator performance every 2 seconds (referring to the operation intervals in the digging cycle), which is too fast compared to real excavator operations. This could lead to:
+The user identified that the current simulation had timing issues that could lead to unrealistic torque requirements. The evaluation was happening every 0.5 seconds and the digging cycle completed in only 7 seconds, both too fast compared to real excavator operations. This could lead to:
 1. ML agents learning to apply excessive torque to meet unrealistic timing constraints
 2. Simulation behavior that doesn't match real-world excavator operation patterns
 3. Training results that wouldn't transfer well to actual excavator control
@@ -23,12 +23,12 @@ Changes Made
 
 2. Digging Cycle Timing (digCycle function)
    Extended all operation timings to reflect realistic excavator movement speeds:
-   - Arm down: 2s → 4s
-   - Stick extend: 2s → 5s  
-   - Bucket close: 3s → 7s
-   - Arm lift: 6s → 12s
-   - Bucket open: 7s → 14s
-   - Arm extend: 7s → 15s
+   - arm movement (initial positioning): 2s → 4s
+   - stick movement (extend for digging): 2s → 5s  
+   - bucket movement (close/scoop): 3s → 7s
+   - arm movement (lift with load): 6s → 12s
+   - bucket movement (open/dump): 7s → 14s
+   - arm movement (final position): 7s → 15s
    
    Total cycle duration: 7 seconds → 15 seconds
    Files: test1.agxPy, test2.agxPy, test3.agxPy
